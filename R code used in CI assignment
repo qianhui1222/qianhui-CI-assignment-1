@@ -1,0 +1,219 @@
+R version 4.1.2 (2021-11-01) -- "Bird Hippie"
+
+#part 1 differential expression analysis
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("DESeq2")
+library(DESeq2)
+
+rna.data <- read.table("TCGA.LIHC.sampleMap_HiSeqV2",sep="\t",head=TRUE,row.names=1)
+rna.data <- as.data.frame(rna.data)
+rna.data <- 2^rna.data-1
+rna.data <- round(rna.data,digits=0)
+
+group_list=factor(ifelse(as.numeric(substr(colnames(rna.data),14,15)) < 10,'tumor','normal'))
+table(group_list)
+
+patient <- colnames(rna.data)
+metadata <- data.frame(sample_id = patient)
+metadata$type <- group_list
+
+dds <-DESeqDataSetFromMatrix(countData=rna.data, 
+                             colData=metadata, 
+                             design=~type)
+dds <- dds[rowSums(counts(dds))>1,]
+dds <- DESeq(dds)
+contrast <- c("type", "tumor", "normal")
+res <- results(dds, contrast=contrast)
+res_order <- res[order(res$padj),]
+deg <- res_order[!is.na(res_order$padj) &
+                    res_order$padj<0.05 &
+                    abs(res_order$log2FoldChange)>=0.6,]
+deg <- as.data.frame(deg)
+#20530 genes->7859 genes
+
+rna.data <- read.table("TCGA.LIHC.sampleMap_HiSeqV2",sep="\t",head=TRUE,row.names=1)
+rna.data <- as.matrix(rna.data)
+deg.rna.data<-rna.data[rownames(deg),]
+surv.data <- read.table("survival_LIHC_survival.txt", sep="\t", header=T,row.names=1)
+rownames(surv.data)<-gsub(rownames(surv.data), pattern="-", replace=".")
+
+med <- apply(deg.rna.data,1,median) 
+med <- as.data.frame(med)
+low <- which(apply(deg.rna.data,1,median) < 0.00001) 
+deg.rna.data <- deg.rna.data[-low,]
+#7859 genes ->7133 genes
+
+#part 2 survival analysis
+
+library(survival)
+os.time <- surv.data[colnames(deg.rna.data),"OS.time"]
+os.event <- as.numeric(surv.data[colnames(deg.rna.data),"OS"])
+lihc.os <- Surv(os.time,os.event)
+
+results.univariate<-array(NA, c(nrow(deg.rna.data),4))
+colnames(results.univariate)<-c("HR","LCI","UCI","PVAL")
+rownames(results.univariate)<-rownames(deg.rna.data)
+results.univariate<-as.data.frame(results.univariate)
+for(i in 1:nrow(deg.rna.data))
+{
+  
+  coxphmodel <- coxph(lihc.os ~ as.numeric(deg.rna.data[i,]))
+  results.univariate$HR[i] <- summary(coxphmodel)$coef[1,2]
+  results.univariate$LCI[i] <- summary(coxphmodel)$conf.int[1,3]
+  results.univariate$UCI[i] <- summary(coxphmodel)$conf.int[1,4]
+  results.univariate$PVAL[i] <- summary(coxphmodel)$coef[1,5]
+}
+results.univariate<-as.data.frame(results.univariate)
+results.univariate$FDR<-p.adjust(results.univariate$PVAL,method="fdr")
+results.univariate<-results.univariate[order(results.univariate$FDR, decreasing=F),]
+results.univariate[1:10,]
+
+clin.data <- read.table("TCGA.LIHC.sampleMap_LIHC_clinicalMatrix", sep="\t", header=T, row.names=1)
+rownames(clin.data)<-gsub(rownames(clin.data), pattern="-", replace=".")
+clin.data<-clin.data[colnames(deg.rna.data),]
+
+x1<-grep("Hepatitis",clin.data$viral_hepatitis_serology)
+hepatitis<-rep(0,nrow(clin.data))
+hepatitis[x1]<-1
+summary(coxph(lihc.os ~ hepatitis))$coef
+
+x1<-grep("No",clin.data$hist_hepato_carc_fact)
+x2<-grep("Other",clin.data$hist_hepato_carc_fact)
+risk<-rep(1,nrow(clin.data))
+risk[c(x1,x2)]<-0
+summary(coxph(lihc.os ~ risk))$coef
+
+x3<-grep("III",clin.data$pathologic_stage)
+x4<-grep("IV",clin.data$pathologic_stage)
+stage.high<-rep(0,nrow(clin.data))
+stage.high[c(x3,x4)]<-1
+summary(coxph(lihc.os ~ stage.high))$coef
+
+results.multivariate<-array(NA, c(nrow(deg.rna.data),4))
+colnames(results.multivariate)<-c("HR","LCI","UCI","PVAL")
+rownames(results.multivariate)<-rownames(deg.rna.data)
+results.multivariate<-as.data.frame(results.multivariate)
+
+for(i in 1:nrow(deg.rna.data))
+{
+  coxphmodel <- coxph(lihc.os ~ deg.rna.data[i,]+hepatitis+stage.high+risk)
+  results.multivariate$HR[i] <- summary(coxphmodel)$coef[1,2]
+  results.multivariate$LCI[i] <- summary(coxphmodel)$conf.int[1,3]
+  results.multivariate$UCI[i] <- summary(coxphmodel)$conf.int[1,4]
+  results.multivariate$PVAL[i] <- summary(coxphmodel)$coef[1,5]
+}
+
+results.multivariate<-as.data.frame(results.multivariate)
+results.multivariate$FDR<-p.adjust(results.multivariate$PVAL,method="fdr")
+results.multivariate<-results.multivariate[order(results.multivariate$FDR, decreasing=F),]
+results.multivariate[1:10,]
+summary(rna.data["TRNP1",])
+
+TRNP1.high <- as.numeric(deg.rna.data["TRNP1",]>median(deg.rna.data["TRNP1",]))
+png("LIHC_OS_by_TRNP1.png",width=6,height=6,units='in',res=300)
+plot(survfit(lihc.os ~ TRNP1.high),col=c("#F4A582","#4393C3"),lwd=2,mark.time=TRUE, xlab="OS time (days)", ylab="proportion surviving", main="Trnp1 in Liver cancer", xlim=c(0,3000))
+legend("topright",legend=c("Trnp1-high","Trnp1-low"),col=c("#4393C3","#F4A582"),lwd=2)
+text(2300,0.09,"HR=1.18 (95%CI:1.10 - 1.27)")
+dev.off()
+
+library(ggplot2)
+library(ggpubr)
+dat<-data.frame(condition=group_list, p=colnames(deg.rna.data),RNAseq=as.numeric(deg.rna.data["TRNP1",]))
+png("TRNP1_by_condition.png",width=6,height=6,units='in',res=300)
+ggplot(dat, aes(condition, RNAseq, fill=condition)) + scale_fill_manual(values=c("#4393C3","#F4A582")) + ggtitle("TRNP1 expression in different conditions") + stat_compare_means() + geom_boxplot()
+dev.off()
+
+
+#part 3 DNA methylation analysis
+
+meth.data<-read.table("TCGA.LIHC.sampleMap_HumanMethylation450", sep="\t", header=T, row.names=1)
+meth.annot<-readRDS("annot450k.rds")
+meth.TRNP1<-rownames(meth.annot[which(meth.annot$UCSC_RefGene_Name=="TRNP1"),])
+
+rna.data2<-deg.rna.data[,which(is.element(colnames(deg.rna.data),colnames(meth.data)))]
+meth.data2<-meth.data[,which(is.element(colnames(meth.data),colnames(rna.data2)))]
+surv.data2<-surv.data[which(is.element(rownames(surv.data),colnames(rna.data2))),]
+
+rna.data2<-as.matrix(rna.data2[,order(colnames(rna.data2))])
+meth.data2<-as.matrix(meth.data2[,order(colnames(meth.data2))])
+surv.data2<-as.data.frame(surv.data2[rownames(surv.data2),])
+
+cg.TRNP1<-rownames(meth.annot[which(meth.annot$UCSC_RefGene_Name=="TRNP1"),])
+
+meth.TRNP1<-meth.data2[cg.TRNP1,]
+na.count<-apply(meth.TRNP1,1,function(x) sum(as.numeric(is.na(x))))
+exclude<-as.numeric(na.count>0.5*ncol(meth.TRNP1))
+meth.TRNP1<-meth.TRNP1[which(exclude==0),]
+
+results<-array(NA,c(nrow(meth.TRNP1),4))
+rownames(results)<-rownames(meth.TRNP1)
+colnames(results)<-c("Cor.TRNP1","Cor.test.TRNP1","Mean.high.TRNP1","Mean.low.TRNP1")
+TRNP1.high2 <- as.numeric(as.numeric(rna.data2["TRNP1",])>median(as.numeric(rna.data2["TRNP1",])))
+for (i in 1:nrow(meth.TRNP1))
+{
+  results[i,1]<-cor.test(as.numeric(rna.data2["TRNP1",]),as.numeric(meth.TRNP1[i,]), method = "spearman")$est
+  results[i,2]<-cor.test(as.numeric(rna.data2["TRNP1",]),as.numeric(meth.TRNP1[i,]), method = "spearman")$p.value
+}
+
+results[,3]<-apply(meth.TRNP1[,which(TRNP1.high2==1)],1,mean,na.rm=T)
+results[,4]<-apply(meth.TRNP1[,which(TRNP1.high2==0)],1,mean,na.rm=T)
+results<-as.data.frame(results)
+results$FDR<-p.adjust(results$Cor.test.TRNP1,method="fdr")
+results<-results[order(results$FDR, decreasing=F),]
+#cg05116424, 0.53
+
+png("LIHC_TRNP1_ExpVsMeth_p.png",width=6,height=6,units='in',res=300)
+plot(as.numeric(meth.data2["cg05116424",]),as.numeric(rna.data2["TRNP1",]), xlab="cg05116424", ylab="TRNP1 RNAseq")
+abline(lm(rna.data2["TRNP1",]~meth.data2["cg05116424",]))
+legend("topleft",legend="correlation: 0.53")
+dev.off()
+
+
+png("LIHC_TRNP1_ExpVsMeth_n.png",width=6,height=6,units='in',res=300)
+plot(as.numeric(meth.data2["cg02618553",]),as.numeric(rna.data2["TRNP1",]), xlab="cg02618553", ylab="TRNP1 RNAseq")
+abline(lm(rna.data2["TRNP1",]~meth.data2["cg02618553",]))
+legend("topleft",legend="correlation: -0.43")
+dev.off()
+
+#part 4 CNV and mutation analysis
+
+cnv.data <- read.table("TCGA.LIHC.sampleMap_Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes",sep="\t",head=TRUE,row.names=1)
+rna.data3<-deg.rna.data[,which(is.element(colnames(deg.rna.data),colnames(cnv.data)))]
+cnv.data2<-cnv.data[,which(is.element(colnames(cnv.data),colnames(rna.data3)))]
+TRNP1_cnv <- cnv.data2["TRNP1",]
+TRNP1_cnv <- as.data.frame(t(TRNP1_cnv))
+cnv_t <- factor(TRNP1_cnv$TRNP1)
+levels(cnv_t) <- c("homozygous deletion","single copy deletion","diploid normal copy","low-level copy number amplification")
+TRNP1_cnv$cnv_type <- cnv_t
+
+png("CNV distribution of TRNP1",width=6,height=6,units='in',res=300)
+ggplot(TRNP1_cnv, aes(x = cnv_type)) + geom_bar() + ggtitle("CNV distribution of TRNP1")
+dev.off()
+
+TRNP1_cnv <- cnv.data2["TRNP1",]
+TRNP1_cnv <- as.data.frame(t(TRNP1_cnv))
+cnv_t <- factor(TRNP1_cnv$TRNP1)
+levels(cnv_t) <- c("abnormal","abnormal","normal","abnormal")
+TRNP1.high3 <- factor(as.numeric(rna.data3["TRNP1",]>median(rna.data3["TRNP1",])))
+levels(TRNP1.high3) <- c("low","high")
+TRNP1_cnv$cnv_type <- cnv_t
+TRNP1_cnv$rna_level <- TRNP1.high3
+rna_cnv <- table(TRNP1_cnv$cnv_type, TRNP1_cnv$rna_level)
+
+#         low high
+#abnormal  81   77
+#normal   101  105
+
+chisq.test(rna_cnv)
+
+#Pearson's Chi-squared test with Yates' continuity correction
+
+#data:  rna_cnv
+#X-squared = 0.10065, df = 1, p-value = 0.751
+
+somatic <- read.table("mc3_LIHC_mc3.txt", sep="\t", header=T)
+TRNP1.mutation <- somatic[somatic$gene == "TRNP1",]
+#no TRNP1 mutation
